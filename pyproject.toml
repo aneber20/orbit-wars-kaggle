@@ -1,0 +1,11 @@
+[project]
+name = "orbit-wars-kaggle"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "kaggle-environments>=1.20.1",
+    "kaggle>=1.7.4.5",
+    "ipykernel>=7.2.0",
+]
