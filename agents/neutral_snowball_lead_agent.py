@@ -3,7 +3,7 @@ import math
 
 CONFIG = {
     "opening_until": 90,
-    "enemy_attack_after": 80,
+    "enemy_attack_after": 90,
     "reservation_after": 45,
     "reserved_angle": 0.10,
     "radar_angle": 0.14,
@@ -12,15 +12,15 @@ CONFIG = {
     "mid_reserve": 1,
     "late_reserve": 2,
     "production_reserve_scale": 0.10,
-    "opening_max_send_fraction": 0.95,
+    "opening_max_send_fraction": 1.0,
     "mid_max_send_fraction": 0.90,
     "late_max_send_fraction": 0.82,
     "max_targets_per_source": 8,
     "max_moves_per_turn": 999,
     "allow_duplicate_targets": False,
-    "score_mode": "cost_aware",
-    "neutral_bonus": 1.20,
-    "enemy_bonus_mid": 0.85,
+    "score_mode": "baseline",
+    "neutral_bonus": 1.35,
+    "enemy_bonus_mid": 0.65,
     "enemy_bonus_late": 1.10,
     "cost_weight": 0.25,
     "pressure_weight": 0.30,
@@ -29,7 +29,7 @@ CONFIG = {
     "neutral_overkill": 1,
     "enemy_margin": 5,
     "estimate_scale": 0.8,
-    "defend_after": 85,
+    "defend_after": 120,
     "defense_extra": 1,
     "max_defense_moves": 2,
 }
@@ -62,6 +62,56 @@ def get_angle(source, target):
     return math.atan2(target[3] - source[3], target[2] - source[2])
 
 
+def planet_xy_at(planet, obs, turns_ahead=0.0):
+    if turns_ahead <= 0:
+        return planet[2], planet[3]
+
+    pid = planet[0]
+    for group in obs.get("comets", []):
+        if pid in group.get("planet_ids", []):
+            idx = group.get("planet_ids", []).index(pid)
+            path = group.get("paths", [[]])[idx]
+            path_index = group.get("path_index", -1)
+            future_index = max(
+                0,
+                min(len(path) - 1, path_index + int(math.ceil(turns_ahead))),
+            )
+            if path:
+                return path[future_index][0], path[future_index][1]
+
+    initial_by_id = {p[0]: p for p in obs.get("initial_planets", [])}
+    initial = initial_by_id.get(pid)
+    angular_velocity = obs.get("angular_velocity")
+    if initial is None or angular_velocity is None:
+        return planet[2], planet[3]
+
+    dx = initial[2] - 50.0
+    dy = initial[3] - 50.0
+    orbital_radius = math.hypot(dx, dy)
+    if orbital_radius + planet[4] >= 50.0:
+        return planet[2], planet[3]
+
+    initial_angle = math.atan2(dy, dx)
+    future_step = obs.get("step", 0) + turns_ahead
+    future_angle = initial_angle + angular_velocity * future_step
+    return (
+        50.0 + orbital_radius * math.cos(future_angle),
+        50.0 + orbital_radius * math.sin(future_angle),
+    )
+
+
+def get_lead_angle(source, target, ships_to_send, obs, lead_scale=1.0, iterations=5):
+    speed = fleet_speed(max(1, ships_to_send))
+    turns = distance(source, target) / speed
+
+    for _ in range(iterations):
+        tx, ty = planet_xy_at(target, obs, turns * lead_scale)
+        turns = math.hypot(tx - source[2], ty - source[3]) / speed
+
+    tx, ty = planet_xy_at(target, obs, turns * lead_scale)
+    return math.atan2(ty - source[3], tx - source[2])
+
+
 def path_hits_sun(source, angle, sun_center=(50.0, 50.0), sun_radius=10.0, buffer=0.5):
     sx, sy = source[2], source[3]
     cx, cy = sun_center
@@ -77,7 +127,7 @@ def path_hits_sun(source, angle, sun_center=(50.0, 50.0), sun_radius=10.0, buffe
     return math.hypot(closest_x - cx, closest_y - cy) <= sun_radius + buffer
 
 
-def infer_fleet_target(fleet, planets, angle_threshold=0.12):
+def infer_fleet_target(fleet, planets, angle_threshold=0.12, obs=None):
     fx, fy = fleet[2], fleet[3]
     fleet_angle = fleet[4]
     origin_id = fleet[5]
@@ -88,7 +138,11 @@ def infer_fleet_target(fleet, planets, angle_threshold=0.12):
         if planet[0] == origin_id:
             continue
 
-        target_angle = math.atan2(planet[3] - fy, planet[2] - fx)
+        pseudo_source = [-1, fleet[1], fx, fy, 0, fleet[6], 0]
+        if obs is None:
+            target_angle = math.atan2(planet[3] - fy, planet[2] - fx)
+        else:
+            target_angle = get_lead_angle(pseudo_source, planet, fleet[6], obs)
         diff = angle_diff(target_angle, fleet_angle)
         if diff < best_diff:
             best_diff = diff
@@ -109,7 +163,7 @@ def get_reserved_targets(obs, angle_threshold=0.1, use_capture_filter=False):
         if fleet[1] != player:
             continue
 
-        target = infer_fleet_target(fleet, planets, angle_threshold=angle_threshold)
+        target = infer_fleet_target(fleet, planets, angle_threshold=angle_threshold, obs=obs)
         if target is None:
             continue
 
@@ -132,7 +186,7 @@ def incoming_ships_by_planet(obs, owner=None, enemy_only=False, angle_threshold=
         if owner is not None and fleet[1] != owner:
             continue
 
-        target = infer_fleet_target(fleet, planets, angle_threshold=angle_threshold)
+        target = infer_fleet_target(fleet, planets, angle_threshold=angle_threshold, obs=obs)
         if target is not None:
             incoming[target[0]] = incoming.get(target[0], 0) + fleet[6]
 
@@ -234,7 +288,7 @@ def v2_build_candidates(obs, my_planets, targets, reserved_targets, launched_by_
             if ships_needed > sendable:
                 continue
 
-            angle = get_angle(source, target)
+            angle = get_lead_angle(source, target, ships_needed, obs)
             if path_hits_sun(source, angle, buffer=config["sun_buffer"]):
                 continue
 
@@ -282,7 +336,7 @@ def v2_add_late_defense(obs, my_planets, moves, launched_by_source, config):
             if ships <= 0:
                 continue
 
-            angle = get_angle(source, target)
+            angle = get_lead_angle(source, target, ships, obs)
             if path_hits_sun(source, angle, buffer=config["sun_buffer"]):
                 continue
 
